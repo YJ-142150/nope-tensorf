@@ -2,7 +2,7 @@ model:
   num_layers: 8
   freeze_network: False
   use_image_feature: False
-  network_type: official
+  network_type: tensorf #official
   occ_activation: softplus
   hidden_dim: 256
   pos_enc_levels: 10
@@ -30,7 +30,8 @@ dataloading:
   sample_rate: 8
 
 rendering:
-  type: nope_nerf # changed
+  N_samples: 400000
+  type: tensorf #nope_nerf # changed
   n_max_network_queries: 64000
   white_background: False
   radius: 4.0
@@ -42,6 +43,11 @@ rendering:
   normal_loss: False
   sample_option: uniform
   outside_steps: 0
+  nSamples: 1000000
+  N_voxel_init: 2097156 # 128**3
+  step_ratio: 0.5
+  batch_size: 4096
+  ndc_ray: 1
 depth:
   type: None
   path: DPT/dpt_hybrid-midas-501f0c75.pt
@@ -68,7 +74,7 @@ distortion:
   learn_scale: True
   learn_shift: True
 training:
-  type: nope_nerf
+  type: tensorf #nope_nerf
   load_dir: model.pt
   load_pose_dir: model_pose.pt
   load_focal_dir: model_focal.pt
@@ -99,6 +105,8 @@ training:
   pc_weight: [1.0, 0.0]
   rgb_s_weight: [1.0, 0.0]
   depth_consistency_weight: [0.0, 0.0]
+  TV_weight_density: [1.0, 0.0] #수정
+  TV_weight_app: [1.0, 0.0] #수정
   rgb_loss_type: l1
   depth_loss_type: l1
   log_scale_shift_per_view: False
@@ -145,5 +153,26 @@ eval_pose:
   extraction_dir: extraction
   init_method: pre
   opt_eval_lr: 0.001
-
-
+model_name:
+  model_name: TensorVMSplit
+  ndc_ray: 1
+  n_lamb_sigma: [16,4,4]
+  n_lamb_sh: [48,12,12]
+  upsamp_list: [2000,3000,4000,5500] #수정
+  update_AlphaMask_list: [2500] #수정
+  data_dim_color: 27
+  shadingMode: MLP_Fea
+  alpha_mask_thre: 0.0001
+  density_shift: -10
+  distance_scale: 25
+  pos_pe: 6
+  view_pe: 0 #6
+  fea_pe: 0 #6
+  featureC: 256
+  step_ratio: 0.5
+  fea2denseAct: relu
+  N_voxel_init: 2097156 # 128**3
+  N_voxel_final: 262144000 # 640**3
+  nSamples: 1000000 #e6
+  white_bg: False
+  near_far: [0.1, 1.0] # tanks: [0.01, 6.0], llff: [0.1, 1.0], blender: [2.0,6.0]

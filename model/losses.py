@@ -12,6 +12,24 @@ class Loss_Eval(nn.Module):
             'loss': loss
         }
         return return_dict
+
+class TVLoss(nn.Module):
+    def __init__(self,TVLoss_weight=1):
+        super(TVLoss,self).__init__()
+        self.TVLoss_weight = TVLoss_weight
+
+    def forward(self,x):
+        batch_size = x.size()[0]
+        h_x = x.size()[2]
+        w_x = x.size()[3]
+        count_h = self._tensor_size(x[:,:,1:,:])
+        count_w = self._tensor_size(x[:,:,:,1:])
+        h_tv = torch.pow((x[:,:,1:,:]-x[:,:,:h_x-1,:]),2).sum()
+        w_tv = torch.pow((x[:,:,:,1:]-x[:,:,:,:w_x-1]),2).sum()
+        return self.TVLoss_weight*2*(h_tv/count_h+w_tv/count_w)/batch_size
+
+    def _tensor_size(self,t):
+        return t.size()[1]*t.size()[2]*t.size()[3]
     
 class Loss(nn.Module):
     def __init__(self, cfg=None):
@@ -155,12 +173,27 @@ class Loss(nn.Module):
             diff_img = (0.15 * diff_img + 0.85 * ssim_map)
         loss = self.mean_on_mask(diff_img, valid_points)
         return loss
-    def forward(self, rgb_pred, rgb_gt,  depth_pred=None, depth_gt=None, 
+
+    def TV_loss_density(self, reg):
+        total = 0
+        for idx in range(len(self.density_line)):
+            total = total + reg(self.density_line[idx]) * 1e-3
+        return total
+
+    def TV_loss_app(self, reg):
+        total = 0
+        for idx in range(len(self.app_line)):
+            total = total + reg(self.app_line[idx]) * 1e-3
+        return total
+
+    def forward(self, model, rgb_pred, rgb_gt,  depth_pred=None, depth_gt=None,
                 t_list=None, X=None, Y=None,  rgb_pc1=None, 
                 rgb_pc1_proj=None, valid_points=None, 
                 d1_proj=None, d2=None, d2_proj=None, d1=None, weights={}, rgb_loss_type='l2', **kwargs):
         rgb_gt = rgb_gt.cuda()
-        
+
+        tvreg = TVLoss()
+
         if weights['rgb_weight'] != 0.0:
             rgb_full_loss = self.get_rgb_full_loss(rgb_pred, rgb_gt, rgb_loss_type)
         else:
@@ -186,7 +219,15 @@ class Loss(nn.Module):
             depth_consistency_loss = self.get_depth_consistency_loss(d1_proj, d2, d2_proj, d1)
         else: 
             depth_consistency_loss = torch.tensor(0.0).cuda().float()
-        
+        if weights['TV_weight_density']!=0.0:
+            loss_tv1 = model.renderer.model.TV_loss_density(tvreg)
+        else:
+            loss_tv1 = torch.tensor(0.0).cuda().float()
+        if weights['TV_weight_app']!=0.0:
+            loss_tv2 = model.renderer.model.TV_loss_app(tvreg)
+        else:
+            loss_tv2 = torch.tensor(0.0).cuda().float()
+
 
         if (weights['rgb_weight']!=0.0) or (weights['depth_weight'] !=0.0):
             rgb_l2_mean = F.mse_loss(rgb_pred, rgb_gt)
@@ -199,7 +240,9 @@ class Loss(nn.Module):
                             weights['weight_dist_2nd_loss'] * loss_dist_2nd+\
                                 weights['pc_weight'] * pc_loss+\
                                     weights['rgb_s_weight'] * rgb_s_loss+\
-                                        weights['depth_consistency_weight'] * depth_consistency_loss
+                                        weights['depth_consistency_weight'] * depth_consistency_loss+\
+                                            weights['TV_weight_density'] * loss_tv1+\
+                                                weights['TV_weight_app'] * loss_tv2
                                                                
         if torch.isnan(loss):
             breakpoint()
@@ -212,7 +255,9 @@ class Loss(nn.Module):
             'loss_dist_2nd': loss_dist_2nd,
             'loss_pc': pc_loss,
             'loss_rgb_s': rgb_s_loss,
-            'loss_depth_consistency': depth_consistency_loss
+            'loss_depth_consistency': depth_consistency_loss,
+            'loss_tv1': loss_tv1,
+            'loss_tv2': loss_tv2
         }
      
         return return_dict

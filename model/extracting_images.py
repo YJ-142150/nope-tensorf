@@ -83,8 +83,8 @@ class Extract_Images(object):
                 rgb_pred = \
                     [self.renderer(
                         pixels_i, None, camera_mat, world_mat, scale_mat, 
-                    'phong_renderer', eval_=True, it=it, add_noise=False)['rgb']
-                        for ii, pixels_i in enumerate(torch.split(pixels, 1024, dim=1))]
+                    'tensorf_renderer', eval_=True, it=it, add_noise=False)['rgb']
+                        for ii, pixels_i in enumerate(torch.split(pixels, 1024, dim=1))] #phong_renderer
             
                 rgb_pred = torch.cat(rgb_pred, dim=1).cpu()
                 p_loc1 = p_loc[mask_pred]

@@ -7,8 +7,30 @@ from .common import (
 from .common import get_ndc_rays_fxfy
 
 epsilon = 1e-6
+from .utils import *
+
+def OctreeRender_trilinear_fast(rays, tensorf, chunk=4096, N_samples=-1, ndc_ray=False, white_bg=True, is_train=False,device='cuda'):
+    rgbs, alphas, depth_maps, weights, uncertainties = [], [], [], [], []
+    N_rays_all = rays.shape[0]
+    for chunk_idx in range(N_rays_all // chunk + int(N_rays_all % chunk > 0)):
+        rays_chunk = rays[chunk_idx * chunk:(chunk_idx + 1) * chunk].to(device)
+
+        rgb_map, depth_map = tensorf(rays_chunk, is_train=is_train, white_bg=white_bg, ndc_ray=ndc_ray,
+                                     N_samples=N_samples)
+
+        rgbs.append(rgb_map)
+        depth_maps.append(depth_map)
+
+    return torch.cat(rgbs), None, torch.cat(depth_maps), None, None
+
+def N_to_reso(n_voxels, bbox):
+    xyz_min, xyz_max = bbox
+    dim = len(xyz_min)
+    voxel_size = ((xyz_max - xyz_min).prod() / n_voxels).pow(1 / dim)
+    return ((xyz_max - xyz_min) / voxel_size).long().tolist()
+
 class Renderer(nn.Module):
-    def __init__(self, model, cfg, device=None,
+    def __init__(self, model, aabb, cfg, device=None,
                  **kwargs):
         super().__init__()
         self._device = device
@@ -17,6 +39,11 @@ class Renderer(nn.Module):
         self.white_background = cfg['white_background']
         self.cfg= cfg
         self.model = model.to(device)
+
+        self.reso_cur = N_to_reso(cfg['N_voxel_init'], aabb)
+        self.nSamples = min(cfg['nSamples'], cal_n_samples(self.reso_cur, cfg['step_ratio']))
+        self.ndc_ray = cfg['ndc_ray']
+        self.batch_size = cfg['batch_size']
 
 
     def forward(self, pixels, depth, camera_mat, world_mat, scale_mat, 
@@ -31,6 +58,17 @@ class Renderer(nn.Module):
             out_dict = self.phong_renderer(
                 pixels, camera_mat, world_mat, scale_mat, it=it
             )
+        elif rendering_technique == 'tensorf_renderer':
+            out_dict = self.tensorf_renderer(
+                pixels, depth, camera_mat, world_mat,
+                scale_mat, it=it, add_noise=add_noise, eval_=eval_
+            )
+        elif rendering_technique == 'tensorf':
+            out_dict = self.tensorf(
+                pixels, depth, camera_mat, world_mat,
+                scale_mat, it=it, add_noise=add_noise, eval_=eval_
+            )
+
         return out_dict
    
     def nope_nerf(self, pixels, depth, camera_mat, world_mat, 
@@ -107,8 +145,8 @@ class Renderer(nn.Module):
         rgb_fg, logits_alpha_fg = [], []
         for i in range(0, pts.shape[0], n_max_network_queries):
             rgb_i, logits_alpha_i= self.model(
-                pts[i:i+n_max_network_queries], 
-                ray_vector_fg[i:i+n_max_network_queries], 
+                pts[i:i+n_max_network_queries],
+                ray_vector_fg[i:i+n_max_network_queries],
                 return_addocc=True, noise=noise, it=it
             )
             rgb_fg.append(rgb_i)
@@ -165,6 +203,211 @@ class Renderer(nn.Module):
             'alpha': alpha
         }
         return out_dict
+
+    def tensorf(self, pixels, depth, camera_mat, world_mat,
+                  scale_mat, add_noise=False, it=100000, eval_=False):
+        # Get configs
+        batch_size, n_points, _ = pixels.shape
+        device = self._device
+        full_steps = self.cfg['num_points']
+        dist_alpha = self.cfg['dist_alpha']
+        sample_option = self.cfg['sample_option']
+        use_dir = self.cfg['use_ray_dir']
+        normalise_ray = self.cfg['normalise_ray']
+        normal_loss = self.cfg['normal_loss']
+        outside_steps = self.cfg['outside_steps']
+
+        depth_range = torch.tensor(self.depth_range)
+        n_max_network_queries = self.n_max_network_queries
+
+        # Find surface points in world coorinate
+        camera_world = origin_to_world(
+            n_points, camera_mat, world_mat, scale_mat
+        )
+        #print('camera_world', camera_world.shape)
+        points_world = transform_to_world(pixels, depth, camera_mat, world_mat, scale_mat)
+
+        d_i_gt = torch.norm(points_world - camera_world, p=2, dim=-1)
+
+        # Prepare camera projection
+        pixels_world = image_points_to_world(
+            pixels, camera_mat, world_mat, scale_mat
+        )
+        ray_vector = (pixels_world - camera_world)
+        ray_vector_norm = ray_vector.norm(2, 2)
+        if normalise_ray:
+            ray_vector = ray_vector / ray_vector.norm(2, 2).unsqueeze(-1)  # normalised ray vector
+        else:
+            d_i_gt = d_i_gt / ray_vector_norm  # used for guide sampling, convert dist to depth
+
+        d_i = d_i_gt.clone()
+        # Get mask for where first evaluation point is occupied
+        mask_zero_occupied = d_i == 0
+
+        # Get mask for predicted depth
+        mask_pred = get_mask(d_i)
+
+        # with torch.no_grad():
+        dists = torch.ones_like(d_i).to(device)
+        dists[mask_pred] = d_i[mask_pred]
+        dists[mask_zero_occupied] = 0.
+        network_object_mask = mask_pred & ~mask_zero_occupied
+
+        network_object_mask = network_object_mask[0]
+        dists = dists[0]
+
+        # Project depth to 3d poinsts
+        camera_world = camera_world.reshape(-1, 3)
+        ray_vector = ray_vector.reshape(-1, 3)
+
+        points = camera_world + ray_vector * dists.unsqueeze(-1)
+        points = points.view(-1, 3)
+        z_val = torch.linspace(0., 1., steps=full_steps - outside_steps, device=device)
+        z_val = z_val.view(1, 1, -1).repeat(batch_size, n_points, 1)
+
+        # if sample_option == 'ndc':
+        #     z_val, pts, ray_vector_fg = self.sample_ndc(camera_mat, camera_world, ray_vector, z_val,
+        #                                                 depth_range=[0., 1.])
+        # elif sample_option == 'uniform':
+        #     z_val, pts, ray_vector_fg = self.sample_uniform(camera_world, ray_vector, z_val, add_noise, depth_range)
+
+        # if not use_dir:
+        #     ray_vector_fg = torch.ones_like(ray_vector_fg)
+        # Run Network
+        noise = not eval_
+        rgb_fg, logits_alpha_fg = [], []
+        rays_train = torch.cat([camera_world, ray_vector], 1)
+
+        rgb_values, alphas_map, depth_map, weights, uncertainty = OctreeRender_trilinear_fast(rays_train, self.model, chunk=self.batch_size,
+                                                                        N_samples=self.nSamples, white_bg=self.white_background,
+                                                                        ndc_ray=self.ndc_ray, device=device, is_train=True)
+        dist_pred = depth_map
+        #ndc_ray = 1 if llff, ndc_ray = 0 if blender
+
+
+        # for i in range(0, pts.shape[0], n_max_network_queries):
+        #     rgb_i, logits_alpha_i = self.model(
+        #         pts[i:i + n_max_network_queries],
+        #         ray_vector_fg[i:i + n_max_network_queries],
+        #         return_addocc=True, noise=noise, it=it
+        #     )
+        #     rgb_fg.append(rgb_i)
+        #     logits_alpha_fg.append(logits_alpha_i)
+        # rgb_fg = torch.cat(rgb_fg, dim=0)
+        # logits_alpha_fg = torch.cat(logits_alpha_fg, dim=0)
+        #
+        # rgb = rgb_fg.reshape(batch_size * n_points, full_steps, 3)
+        # alpha = logits_alpha_fg.view(batch_size * n_points, full_steps)
+
+        # if dist_alpha:
+        #     t_vals = z_val.view(batch_size * n_points, full_steps)
+        #     deltas = t_vals[:, 1:] - t_vals[:, :-1]  # (H, W, N_sample-1)
+        #     dist_far = torch.empty(size=(batch_size * n_points, 1), dtype=torch.float32, device=dists.device).fill_(
+        #         1e10)  # (H, W, 1)
+        #     deltas = torch.cat([deltas, dist_far], dim=-1)  # (H, W, N_sample)
+        #     alpha = 1 - torch.exp(-1.0 * alpha * deltas)  # (H, W, N_sample)
+        #     alpha[:, -1] = 1.  # enforce predicted depth>0
+
+        # weights = alpha * torch.cumprod(
+        #     torch.cat([torch.ones((rgb.shape[0], 1), device=device), 1. - alpha + epsilon], -1), -1)[:, :-1]
+        # rgb_values = torch.sum(weights.unsqueeze(-1) * rgb, dim=-2)
+        # dist_pred = torch.sum(weights.unsqueeze(-1) * z_val, dim=-2).squeeze(-1)
+
+        # if not eval_ and normal_loss:
+        #     surface_mask = network_object_mask.view(-1)
+        #     surface_points = points[surface_mask]
+        #     N = surface_points.shape[0]
+        #     surface_points_neig = surface_points + (torch.rand_like(surface_points) - 0.5) * 0.01
+        #     pp = torch.cat([surface_points, surface_points_neig], dim=0)
+        #     g = self.model.gradient(pp, it)
+        #     normals_ = g[:, 0, :] / (g[:, 0, :].norm(2, dim=1).unsqueeze(-1) + 10 ** (-5))
+        #     diff_norm = torch.norm(normals_[:N] - normals_[N:], dim=-1)
+        # else:
+        diff_norm = None
+
+        # if self.white_background:
+        #     acc_map = torch.sum(weights, -1)
+        #     rgb_values = rgb_values + (1. - acc_map.unsqueeze(-1))
+
+        d_i_gt = d_i_gt[0]
+        if eval_ and normalise_ray:
+            # print('-------normalising depth-------')
+            dist_pred = dist_pred / ray_vector_norm[0]  # change dist to depth, consistent with gt depth for evaluation
+            dists = dists / ray_vector_norm[0]
+            d_i_gt = d_i_gt / ray_vector_norm[0]
+        dist_rendered_masked = dist_pred[network_object_mask]
+        dist_dpt_masked = d_i_gt[network_object_mask]
+        if sample_option == 'ndc':
+            dist_dpt_masked = 1 - 1 / dist_dpt_masked
+        out_dict = {
+            'rgb': rgb_values.reshape(batch_size, -1, 3),
+            'z_vals': z_val.squeeze(-1),
+            'normal': diff_norm,
+            'depth_pred': dist_rendered_masked,  # for loss
+            'depth_gt': dist_dpt_masked,  # for loss
+            'alpha': alphas_map
+        }
+        return out_dict
+
+    def tensorf_renderer(self, pixels, depth, camera_mat, world_mat, 
+            scale_mat, add_noise=False, it=100000, eval_=False):
+        # Get configs
+        # 1, 1024, 2
+        batch_size, n_points, _ = pixels.shape
+        device = self._device
+        full_steps = self.cfg['num_points']
+        dist_alpha = self.cfg['dist_alpha']
+        sample_option = self.cfg['sample_option']
+        use_dir = self.cfg['use_ray_dir']
+        normalise_ray = self.cfg['normalise_ray']
+        normal_loss = self.cfg['normal_loss']
+        outside_steps = self.cfg['outside_steps']
+
+
+        depth_range = torch.tensor(self.depth_range)
+        n_max_network_queries = self.n_max_network_queries
+
+        # Find surface points in world coorinate
+        # cam center world
+        camera_world = origin_to_world(     
+                n_points, camera_mat, world_mat, scale_mat)
+            
+        # Prepare camera projection
+        pixels_world = image_points_to_world(
+            pixels, camera_mat, world_mat,scale_mat
+        )
+        # ray_vec (B, N, 3) , ray_vec_norm (B, N)
+        ray_vector = (pixels_world - camera_world)
+        ray_vector_norm = ray_vector.norm(2,2)
+        if normalise_ray:
+            ray_vector = ray_vector/ray_vector.norm(2,2).unsqueeze(-1) # normalised ray vector
+
+        # Project depth to 3d poinsts
+        camera_world = camera_world.reshape(-1, 3)
+        ray_vector = ray_vector.reshape(-1, 3)
+    
+        # points = camera_world + ray_vector * dists.unsqueeze(-1)
+        # points = points.view(-1,3)
+        z_val = torch.linspace(0., 1., steps=full_steps-outside_steps, device=device)
+        z_val = z_val.view(1, 1, -1).repeat(batch_size, n_points, 1)
+
+        rays = torch.cat([camera_world, ray_vector], 1) 
+
+        # octree -> batch 별 tensorf.forward
+        # rgb, depth shape check!
+        rgb, alphas_map, depth_map, weights, uncertainty = OctreeRender_trilinear_fast(rays, self.model, chunk=self.batch_size,
+                                                                        N_samples=self.nSamples, white_bg=self.white_background,
+                                                                        ndc_ray=self.ndc_ray, device=device, is_train=False)
+
+        out_dict = {
+                'rgb': rgb.reshape(batch_size, -1, 3),
+                'normal': None, # not necessary -> default config  == false
+                'rgb_surf': None
+            }
+           
+
+        return out_dict
+
     def sample_ndc(self, camera_mat, camera_world, ray_vector, z_val, depth_range=[0., 1.]):
         batch_size, n_points, full_steps = z_val.shape
         focal = torch.cat([camera_mat[:, 0, 0], camera_mat[:, 1, 1]])
@@ -320,6 +563,7 @@ class Renderer(nn.Module):
 
         # Evaluate all proposal points in parallel
         with torch.no_grad():
+            a = torch.split(p_proposal.reshape(batch_size, -1, 3), int(max_points / batch_size), dim=1)
             val = torch.cat([(
                 self.model(p_split, only_occupancy=True) - tau)
                 for p_split in torch.split(

@@ -22,6 +22,10 @@ class nope_nerf(nn.Module):
             depth_img_resized = F.interpolate(depth_img, img_size ,mode='nearest')
             depth_img_resized = depth_img_resized.view(1, 1, -1).permute(0, 2, 1) 
             depth = depth_img_resized[:,ray_idx]
+        elif rendering_technique=='tensorf':
+            depth_img_resized = F.interpolate(depth_img, img_size ,mode='nearest')
+            depth_img_resized = depth_img_resized.view(1, 1, -1).permute(0, 2, 1)
+            depth = depth_img_resized[:,ray_idx]
         else:
             depth = None
         out_dict = self.renderer(

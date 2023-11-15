@@ -15,6 +15,11 @@ import model as mdl
 from utils_poses.comp_ate import compute_ATE, compute_rpe
 from model.common import backup,  mse2psnr
 from utils_poses.align_traj import align_ate_c2b_use_a2b
+
+from model.renderer import *
+from model.utils import cal_n_samples, N_to_reso
+
+
 def train(cfg):
     logger_py = logging.getLogger(__name__)
 
@@ -36,7 +41,18 @@ def train(cfg):
     test_loader, _ = dl.get_dataloader(cfg, mode=mode, shuffle=cfg['dataloading']['shuffle'])
     iter_test = iter(test_loader)
     data_test = next(iter_test)
-    
+
+    white_bg = cfg['model_name']['white_bg']
+    near_far = cfg['model_name']['near_far']
+    ndc_ray = cfg['model_name']['ndc_ray']
+    # init resolution
+    upsamp_list = cfg['model_name']['upsamp_list']
+    update_AlphaMask_list = cfg['model_name']['update_AlphaMask_list']
+    n_lamb_sigma = cfg['model_name']['n_lamb_sigma']
+    n_lamb_sh = cfg['model_name']['n_lamb_sh']
+    aabb = torch.tensor([[-1.5, -1.67, -1.0], [1.5, 1.67, 1.0]]).to(device) #train_dataset.scene_bbox.to(device)
+    reso_cur = N_to_reso(cfg['model_name']['N_voxel_init'], aabb)
+    nSamples = min(cfg['model_name']['nSamples'], cal_n_samples(reso_cur, cfg['model_name']['step_ratio']))
 
     n_views = train_dataset['img'].N_imgs
     # init network
@@ -47,15 +63,34 @@ def train(cfg):
 
     if network_type=='official':
         model = mdl.OfficialStaticNerf(cfg)
+        # init renderer
+        rendering_cfg = cfg['rendering']
+        renderer = mdl.Renderer(model, rendering_cfg, device=device)
+
+    elif network_type =='tensorf':
+        model = eval(cfg['model_name']['model_name'])(aabb, reso_cur, device,
+                    density_n_comp=n_lamb_sigma, appearance_n_comp=n_lamb_sh, app_dim=cfg['model_name']['data_dim_color'], near_far=near_far,
+                    shadingMode=cfg['model_name']['shadingMode'], alphaMask_thres=cfg['model_name']['alpha_mask_thre'], density_shift=cfg['model_name']['density_shift'], distance_scale=cfg['model_name']['distance_scale'],
+                    pos_pe=cfg['model_name']['pos_pe'], view_pe=cfg['model_name']['view_pe'], fea_pe=cfg['model_name']['fea_pe'], featureC=cfg['model_name']['featureC'], step_ratio=cfg['model_name']['step_ratio'], fea2denseAct=cfg['model_name']['fea2denseAct'])
+        rendering_cfg = cfg['rendering']
+        renderer = mdl.Renderer(model, aabb, rendering_cfg, device=device)
+        # init renderer
+        # renderer = OctreeRender_trilinear_fast(rays_train, tensorf, chunk=args.batch_size,
+        #                         N_samples=nSamples, white_bg = white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
     
-     # init renderer 
-    rendering_cfg = cfg['rendering']
-    renderer = mdl.Renderer(model, rendering_cfg, device=device)
+
     # init model
     nope_nerf = mdl.get_model(renderer, cfg, device=device)
     # init optimizer
     weight_decay = cfg['training']['weight_decay']
     optimizer = optim.Adam(nope_nerf.parameters(), lr=lr, weight_decay=weight_decay)
+
+    N_voxel_list = (torch.round(torch.exp(torch.linspace(np.log(cfg['model_name']['N_voxel_init']), np.log(cfg['model_name']['N_voxel_final']), len(upsamp_list)+1))).long()).tolist()[1:]
+    #
+    # allrays, allrgbs = train_dataset.all_rays, train_dataset.all_rgbs
+    # if not args.ndc_ray:
+    #     allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
+    # trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
 
     # init checkpoints and load
     checkpoint_io = mdl.CheckpointIO(out_dir, model=nope_nerf, optimizer=optimizer)
@@ -204,6 +239,8 @@ def train(cfg):
         L2_loss_epoch = []
         pc_loss_epoch = []
         rgb_s_loss_epoch = []
+        TV_loss_density_epoch = []
+        TV_loss_app_epoch = []
         for batch in train_loader:
             it += 1
             idx = batch.get('img.idx')
@@ -212,6 +249,8 @@ def train(cfg):
             L2_loss_epoch.append(loss_dict['l2_mean'].item())
             pc_loss_epoch.append(loss_dict['loss_pc'].item())
             rgb_s_loss_epoch.append(loss_dict['loss_rgb_s'].item())
+            TV_loss_density_epoch.append(loss_dict['loss_tv1'].item())
+            TV_loss_app_epoch.append(loss_dict['loss_tv2'].item())
             scale_dict['view %02d' % (idx)] = loss_dict['scale']
             shift_dict['view %02d' % (idx)] = loss_dict['shift']
             if print_every > 0 and (it % print_every) == 0:
@@ -238,6 +277,12 @@ def train(cfg):
                             cfg['training']['vis_resolution'], 
                             it, out_render_path)
                 #logger.add_image('rgb', val_rgb, it)
+
+            if it in cfg['model_name']['upsamp_list']:
+                n_voxels = N_voxel_list.pop(0)
+                reso_cur = N_to_reso(n_voxels, model.aabb)
+                model.upsample_volume_grid(reso_cur)
+
             # Run validation
             if validate_every > 0 and (it % validate_every) == 0:
                 eval_dict = trainer.evaluate(test_loader)
@@ -273,7 +318,12 @@ def train(cfg):
         pc_loss_epoch = np.mean(pc_loss_epoch)
         logger.add_scalar('train/loss_pc_epoch', pc_loss_epoch, it) 
         rgb_s_loss_epoch = np.mean(rgb_s_loss_epoch) 
-        logger.add_scalar('train/loss_rgbs_epoch', rgb_s_loss_epoch, it)  
+        logger.add_scalar('train/loss_rgbs_epoch', rgb_s_loss_epoch, it)
+        TV_loss_density_epoch = np.mean(TV_loss_density_epoch)
+        logger.add_scalar('train/loss_tv_loss_density_epoch', TV_loss_density_epoch, it)
+        TV_loss_app_epoch = np.mean(TV_loss_app_epoch)
+        logger.add_scalar('train/loss_tv_loss_app_epoch', TV_loss_app_epoch, it)
+
         if (eval_pose_every>0 and (epoch_it % eval_pose_every) == 0):
             with torch.no_grad():
                 learned_poses = torch.stack([pose_param_net(i) for i in range(n_views)])

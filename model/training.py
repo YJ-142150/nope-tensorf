@@ -60,6 +60,9 @@ class Trainer(object):
         self.weight_dist_2nd_loss = cfg['weight_dist_2nd_loss']
         self.weight_dist_1st_loss = cfg['weight_dist_1st_loss']
         self.depth_consistency_weight = cfg['depth_consistency_weight']
+        self.TV_weight_density = cfg['TV_weight_density']
+        self.TV_weight_app = cfg['TV_weight_app']
+
 
 
         self.loss = Loss(cfg)
@@ -145,9 +148,9 @@ class Trainer(object):
             with torch.no_grad():
                 rgb_pred = \
                     [self.model(
-                         pixels_i, None, camera_mat, world_mat, scale_mat, 'phong_renderer',
+                         pixels_i, None, camera_mat, world_mat, scale_mat, 'tensorf_renderer',
                         add_noise=False, eval_mode=True, it=it, depth_img=depth_input, img_size=(h, w))['rgb']
-                        for i, pixels_i in enumerate(torch.split(pixels, 1024, dim=1))]
+                        for i, pixels_i in enumerate(torch.split(pixels, 1024, dim=1))] #phong
             
                 rgb_pred = torch.cat(rgb_pred, dim=1).cpu()              
                 rgb_pred = rgb_pred.view(h, w, 3).detach().cpu().numpy()
@@ -206,7 +209,7 @@ class Trainer(object):
             out_render_path(str): path to save rendered images
         '''
         weights = {}
-        weights_name_list = ['rgb_weight', 'depth_weight', 'pc_weight', 'rgb_s_weight', 'depth_consistency_weight', 'weight_dist_2nd_loss', 'weight_dist_1st_loss']
+        weights_name_list = ['rgb_weight', 'depth_weight', 'pc_weight', 'rgb_s_weight', 'depth_consistency_weight', 'weight_dist_2nd_loss', 'weight_dist_1st_loss', 'TV_weight_density', 'TV_weight_app']
         weights_list = [self.anneal(getattr(self, w)[0], getattr(self, w)[1], scheduling_start, self.annealing_epochs, epoch) for w in weights_name_list] # loss weights
         rgb_loss_type = 'l1' if epoch < self.annealing_epochs + scheduling_start else 'l2'
 
@@ -368,7 +371,8 @@ class Trainer(object):
         
         if render_model and self.detach_gt_depth:
             gt_depth = gt_depth.detach()
-        loss_dict = self.loss(rendered_rgb, rgb_gt, rendered_depth, gt_depth, **kwargs)
+        #print('model', self.model)
+        loss_dict = self.loss(self.model, rendered_rgb, rgb_gt, rendered_depth, gt_depth, **kwargs)
         if self.optimizer_focal:
             loss_dict['focalx'] = fxfy[0] / camera_mat_gt[0, 0, 0]
             loss_dict['focaly'] = fxfy[1] / camera_mat_gt[0, 1, 1]

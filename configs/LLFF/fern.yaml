@@ -12,7 +12,7 @@ dataloading:
   random_ref: 1
   resize_factor: 4
 training:
-  out_dir:  out/llff/fern
+  out_dir:  out/llff/fern_tensor
   vis_resolution: [75, 100]
 extract_images:
   resolution: [756, 1008]
